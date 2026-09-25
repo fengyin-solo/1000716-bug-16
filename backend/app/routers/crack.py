@@ -1,9 +1,10 @@
-"""裂缝处置接口：维护处置单，覆盖安排处置、确认完成、取消处置等动作。"""
+"""裂缝处置接口：维护处置单，覆盖安排处置、确认完成、退回重做、取消处置等动作。"""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.crack import CrackService
@@ -14,6 +15,35 @@ service = CrackService()
 
 LIST_FIELDS = ["处置单号", "所在路段", "裂缝类型", "裂缝长度", "灌缝材料", "作业班组", "完成日期", "处置状态"]
 STATUSES = ["待安排", "处置中", "已完成", "已取消"]
+
+
+class CrackActionPayload(BaseModel):
+    """动作请求体。
+
+    历史上前端直接发 ``{"action": "确认完成"}`` 这种扁平结构，登记接口则用
+    ``{"values": {...}}``；这里两种都认，避免动作参数被静默吞掉导致流转不落库。
+    """
+
+    action: str | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    remark: str | None = None
+    merge_ids: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_body(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data.get("values") or {})
+        action = data.get("action") or values.get("action")
+        if action:
+            values.setdefault("action", action)
+        return {
+            "action": action,
+            "values": values,
+            "remark": data.get("remark"),
+            "merge_ids": data.get("merge_ids") or values.get("merge_ids") or [],
+        }
 
 
 @router.get("", response_model=PageResult[dict])
@@ -28,6 +58,13 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出裂缝处置清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "crack", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -49,17 +86,23 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
-def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条处置单执行安排处置、确认完成、取消处置；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+def run_action(entry_id: int, payload: CrackActionPayload) -> ActionResult:
+    """对处置单执行安排处置、确认完成、退回重做、取消处置。
+
+    裂缝类型等字段修改、处理意见与照片可随动作一并提交；传入 merge_ids 时
+    按同路段合并处置，主单与被合并单据一起流转并各自留痕。
+    """
+    action = str(payload.action or payload.values.get("action") or "").strip()
+    values = dict(payload.values)
+    values.pop("action", None)
+    values.pop("merge_ids", None)
+    entry, message = service.run_action(
+        entry_id,
+        action,
+        values=values,
+        remark=payload.remark,
+        merge_ids=payload.merge_ids,
+    )
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出裂缝处置清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "crack", "total": total, "items": items}
